@@ -18,7 +18,7 @@ from sqlalchemy import create_engine
 
 _w = WorkspaceClient()
 
-_SCOPE = os.environ.get("LAKEBASE_SECRET_SCOPE", "database")
+_SCOPE = os.environ.get("LAKEBASE_SECRET_SCOPE", "tickets-app-database")
 _KEY = os.environ.get("LAKEBASE_SECRET_KEY", "lakebase-url")
 
 
@@ -58,3 +58,13 @@ def run_write(sql: str, params: tuple | dict | None = None) -> int:
             cur.execute(sql, params)
             conn.commit()
             return cur.rowcount
+
+
+def run_write_returning(sql: str, params: tuple | dict | None = None) -> list[dict]:
+    """Run an INSERT/UPDATE with a RETURNING clause; commit and return the returned rows."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+            conn.commit()
+            return rows
