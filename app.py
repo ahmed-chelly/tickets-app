@@ -1,6 +1,9 @@
 """
 Databricks App: Lakebase-backed internal support ticket system.
 
+The tickets/ticket_messages schema is created once by schema.sql, not by this
+app - the app's Postgres role only needs DML rights, not table ownership.
+
 Routes:
     GET   /                          - ticket UI
     GET   /healthz                   - health check
@@ -30,36 +33,6 @@ app = Flask(__name__)
 ALLOWED_STATUSES = ("open", "in_progress", "resolved")
 
 
-def ensure_schema():
-    """Create the tickets/ticket_messages tables if they don't exist yet."""
-    lakebase.run_write(
-        """
-        CREATE TABLE IF NOT EXISTS tickets (
-            ticket_id   BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-            title       TEXT NOT NULL,
-            status      TEXT NOT NULL DEFAULT 'open'
-                        CHECK (status IN ('open', 'in_progress', 'resolved')),
-            created_by  TEXT NOT NULL,
-            created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-        """
-    )
-    lakebase.run_write(
-        """
-        CREATE TABLE IF NOT EXISTS ticket_messages (
-            message_id    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-            ticket_id     BIGINT NOT NULL REFERENCES tickets(ticket_id) ON DELETE CASCADE,
-            message_text  TEXT NOT NULL,
-            author        TEXT NOT NULL,
-            created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-        """
-    )
-    lakebase.run_write(
-        "CREATE INDEX IF NOT EXISTS idx_ticket_messages_ticket_id ON ticket_messages(ticket_id)"
-    )
-
-
 @app.route("/healthz")
 def healthz():
     return jsonify({"status": "ok"})
@@ -83,7 +56,6 @@ def index():
 
 @app.route("/api/tickets", methods=["GET"])
 def list_tickets():
-    ensure_schema()
     rows = lakebase.run_query(
         "SELECT ticket_id, title, status, created_by, created_at "
         "FROM tickets ORDER BY created_at DESC"
@@ -93,7 +65,6 @@ def list_tickets():
 
 @app.route("/api/tickets", methods=["POST"])
 def create_ticket():
-    ensure_schema()
     data = request.get_json(force=True, silent=True) or {}
 
     title = (data.get("title") or "").strip()
@@ -120,7 +91,6 @@ def create_ticket():
 
 @app.route("/api/tickets/<int:ticket_id>/messages", methods=["GET"])
 def list_messages(ticket_id):
-    ensure_schema()
     ticket = lakebase.run_query(
         "SELECT ticket_id FROM tickets WHERE ticket_id = %s", (ticket_id,)
     )
@@ -137,7 +107,6 @@ def list_messages(ticket_id):
 
 @app.route("/api/tickets/<int:ticket_id>/messages", methods=["POST"])
 def add_message(ticket_id):
-    ensure_schema()
     data = request.get_json(force=True, silent=True) or {}
 
     message_text = (data.get("message_text") or "").strip()
@@ -167,7 +136,6 @@ def add_message(ticket_id):
 
 @app.route("/api/tickets/<int:ticket_id>/status", methods=["PATCH"])
 def update_status(ticket_id):
-    ensure_schema()
     data = request.get_json(force=True, silent=True) or {}
     status = (data.get("status") or "").strip()
 
