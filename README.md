@@ -1,181 +1,158 @@
-# Massive + Lakebase Databricks App Boilerplate
+# Support Desk — a Lakebase-backed Databricks App
 
-A minimal Databricks App that:
-- Connects to **Lakebase** (Databricks-managed Postgres) using a single `LAKEBASE_URL` secret (a native Postgres role with a static password)
-- Calls the **Massive API** (large paginated dataset) using a key stored in a Databricks secret scope
-- Syncs Massive API data into Lakebase in batches
-- Exposes a small Flask API to trigger syncs and read synced records
+An internal support ticket system deployed as a Databricks App. Users can open
+support tickets, hold a threaded conversation on each one, and move tickets
+through a status workflow. All operational data lives in **Lakebase**
+(Databricks-managed Postgres) — nothing is hard-coded or held in memory.
+
+## Features
+
+- **View all tickets**, newest first, with live counts per status
+- **Filter by status** (`open` / `in_progress` / `resolved`) — filtering runs as a
+  SQL `WHERE` clause in Lakebase, not in the browser
+- **Select a ticket** to read its full message thread
+- **Create a ticket** together with its opening message, written in a single
+  transaction so a ticket can never exist without one
+- **Add messages** to an existing ticket
+- **Update a ticket's status**
+- Email addresses are validated in the browser *and* re-validated server-side,
+  since the API can be called directly
+
+## Architecture
+
+```
+Browser (templates/index.html)
+    |  fetch() JSON
+    v
+Flask app (app.py)              <- runs as a Databricks App service principal
+    |  psycopg2
+    v
+Lakebase / Postgres (tickets, ticket_messages)
+```
+
+Credentials are never stored in code. `lakebase.py` reads the Postgres
+connection URL at runtime from a Databricks secret using the workspace SDK.
+`app.yaml` only names the scope and key to read — it holds no secret value:
+
+| Env var                 | Value                  |
+| ----------------------- | ---------------------- |
+| `LAKEBASE_SECRET_SCOPE` | `tickets-app-database` |
+| `LAKEBASE_SECRET_KEY`   | `lakebase-url`         |
+
+The app never runs DDL. The schema is created once by `schema.sql`, so the
+app's Postgres role needs only `SELECT`/`INSERT`/`UPDATE` rights — not table
+ownership.
 
 ## Files
 
-- `app.py` - Flask app: `/healthz`, `/records` (GET), `/sync` (POST)
-- `lakebase.py` - Lakebase connection helper (single `LAKEBASE_URL`, psycopg2 + SQLAlchemy)
-- `massive_client.py` - Massive API client with pagination generator for large datasets
-- `setup_secrets.py` - One-time script to create the secret scopes and store the Massive API key + Lakebase URL
-- `app.yaml` - Databricks App deployment config (command + env vars)
-- `.env.example` - Local dev env var template (copy to `.env`, do not commit real values)
+| File                   | Purpose                                                       |
+| ---------------------- | ------------------------------------------------------------- |
+| `app.py`               | Flask routes for the UI and the ticket/message JSON API        |
+| `lakebase.py`          | Lakebase connection helper (secret lookup, query/write helpers) |
+| `templates/index.html` | Single-page UI (vanilla JS, no build step)                    |
+| `schema.sql`           | Table definitions, sample data, and the app role's grants      |
+| `setup_secrets.py`     | One-time script to store the connection URL as a secret        |
+| `app.yaml`             | Databricks Apps deployment config                             |
+| `requirements.txt`     | Python dependencies                                           |
 
-## Step-by-step setup
+## Data model
 
-### 1. Create a Massive.com account and get an API key
+`ticket_messages.ticket_id` is a foreign key to `tickets.ticket_id`, so deleting
+a ticket removes its messages (`ON DELETE CASCADE`).
 
-1. Go to [https://massive.com](https://massive.com) and sign up for a new account (or log in if you already have one).
-2. Once logged in, open your account/workspace **Settings** (or **Developer** / **API** section, depending on Massive's current UI).
-3. Find **API Keys** and click **Create API Key** (or **Generate New Key**).
-4. Give the key a name (e.g. `databricks-app`) and copy the generated key value immediately — most providers only show it once.
-5. Keep this key handy for step 3 (Store your secrets) below. Do **not** put it in code, `.env` committed to git, or anywhere else in plaintext.
+**tickets**
 
-> If Massive's console differs from the steps above, look for **API Keys**, **Tokens**, or **Credentials** under your account/organization settings — the key is what authenticates requests to `https://api.massive.com` in `massive_client.py`.
+| Column       | Type          | Notes                                        |
+| ------------ | ------------- | -------------------------------------------- |
+| `ticket_id`  | `BIGINT`      | primary key, generated as identity           |
+| `title`      | `TEXT`        | not null                                     |
+| `status`     | `TEXT`        | `open` / `in_progress` / `resolved` (checked) |
+| `created_by` | `TEXT`        | email of the person who opened the ticket    |
+| `created_at` | `TIMESTAMPTZ` | defaults to `now()`                          |
 
-### 2. Create a Lakebase instance and a native-password role
+**ticket_messages**
 
-1. In your Databricks workspace, go to **Catalog** (left sidebar) and select the **Lakebase** tab (or search "Lakebase" in the workspace search bar).
-2. Click **Create Lakebase instance** (sometimes labeled **Create database instance**).
-   - Give it a name (e.g. `massive-sync-db`).
-   - Choose the capacity/compute size and region appropriate for your workload (defaults are fine to start).
-   - Click **Create** and wait for the instance to reach the **Available**/**Running** state.
-3. Open the newly created instance, then go to the **Roles & Databases** tab (sometimes called **Permissions** or **Roles**).
-4. **Enable native (password) authentication** for the instance if it isn't already on:
-   - Look for an authentication setting such as **Native passwords** or **Password authentication** and toggle/enable it. By default some Lakebase instances only support OAuth/token-based auth — you need password auth enabled so the role below gets a static password instead of a short-lived token.
-5. **Create a new role**:
-   - Click **Add role** / **Create role**.
-   - Choose **Password** as the authentication method (not OAuth).
-   - Name the role (e.g. `massive_app`) and let Databricks generate (or set) a password.
-6. **Copy the connection URL** shown for the role. It will look like:
+| Column         | Type          | Notes                              |
+| -------------- | ------------- | ---------------------------------- |
+| `message_id`   | `BIGINT`      | primary key, generated as identity |
+| `ticket_id`    | `BIGINT`      | foreign key → `tickets.ticket_id`  |
+| `message_text` | `TEXT`        | not null                           |
+| `author`       | `TEXT`        | email of the message author        |
+| `created_at`   | `TIMESTAMPTZ` | defaults to `now()`                |
+
+## Setup
+
+### 1. Create a Lakebase instance and a password role
+
+1. In the Databricks workspace, open **Compute** → **Lakebase** (or search for
+   "Lakebase") and create a database instance. Wait for it to become
+   **Available**.
+2. Open the instance's **Roles & Databases** tab and enable native (password)
+   authentication if it isn't already on.
+3. Create a role for the app (this project uses `employe`) with a generated
+   password, and copy the connection URL it gives you:
 
    ```
    postgresql://<role>:<password>@<host>.database.cloud.databricks.com:5432/databricks_postgres?sslmode=require
    ```
 
-   Keep this URL — you'll paste it into `setup_secrets.py`'s prompt in the next step.
+### 2. Store the connection URL as a secret
 
-### 3. Store your secrets
+Run `setup_secrets.py` from a Databricks notebook. It prompts via `getpass`, so
+the URL is never echoed, written to disk, or left in shell history:
 
-Run once from a **Databricks notebook** in your workspace (no CLI needed):
+```python
+%run ./setup_secrets.py
+```
 
-1. Create a new notebook (or open the Git folder you'll create in step 5, once it's cloned) and attach it to any running cluster.
-2. In a cell, run:
+This creates the `tickets-app-database` scope and stores the URL under the
+`lakebase-url` key.
 
-   ```python
-   %sh python setup_secrets.py
-   ```
+### 3. Create the schema, sample data, and grants
 
-   or open a terminal from the notebook (**Run** > **Open terminal**, if enabled on your cluster) and run `python setup_secrets.py` there.
+Run `schema.sql` against the instance — from the SQL Editor with the Lakebase
+instance selected, or via `psql`. It creates both tables, inserts sample
+tickets and messages, and grants the app's role the DML rights it needs.
 
-This prompts (via `getpass`, so nothing is echoed or written to disk/shell history) for:
-- Your **Massive API key** (from step 1) → stored as secret `massive/api-key`
-- Your **Lakebase connection URL** (from step 2) → stored as secret `database/lakebase-url`
+Run it as a role allowed to create tables (for example your own Databricks
+identity). The `GRANT` statements at the bottom must be run **by the table
+owner**, otherwise the app will fail with `permission denied for table tickets`.
 
-### 4. Configure environment variables (local dev)
+### 4. Deploy
 
-Copy `.env.example` to `.env` and paste your Lakebase URL as `LAKEBASE_URL` for local runs:
+Push this repository to GitHub, then in **Compute** → **Apps** create an app
+pointing at the repo (or at a Databricks Git folder containing it). Databricks
+reads `app.yaml` to start the app. Redeploy from the Apps UI after each push.
+
+## API
+
+| Method  | Path                            | Purpose                                     |
+| ------- | ------------------------------- | ------------------------------------------- |
+| `GET`   | `/`                             | The ticket UI                               |
+| `GET`   | `/healthz`                      | Health check                                |
+| `GET`   | `/api/tickets`                  | List tickets; optional `?status=<status>`   |
+| `GET`   | `/api/tickets/stats`            | Ticket counts per status                    |
+| `POST`  | `/api/tickets`                  | Create a ticket and its opening message     |
+| `GET`   | `/api/tickets/<id>/messages`    | List a ticket's messages                    |
+| `POST`  | `/api/tickets/<id>/messages`    | Add a message to a ticket                   |
+| `PATCH` | `/api/tickets/<id>/status`      | Update a ticket's status                    |
+
+Create a ticket:
 
 ```bash
-cp .env.example .env
+curl -X POST /api/tickets -H "Content-Type: application/json" -d '{
+  "title": "Cannot log into dashboard",
+  "created_by": "alice@example.com",
+  "first_message": "I get an invalid credentials error even with the right password.",
+  "status": "open"
+}'
 ```
 
-For deployment, `app.yaml` already pulls `LAKEBASE_URL` from the `database/lakebase-url` secret automatically — no manual editing needed there.
+## Security notes
 
-### 5. Install dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-### 6. Run locally
-
-```bash
-python app.py
-```
-
-### 7. Create a Git folder in Databricks and deploy the app (no CLI required)
-
-All of this is done through the Databricks workspace UI:
-
-1. **Create a Git folder**:
-   - In the Databricks workspace sidebar, click **Workspace** > **Create** > **Git folder** (in older UIs this is called **Repos** > **Add Repo**).
-   - Paste the Git URL of this project's repository (e.g. your GitHub/GitLab remote for this codebase).
-   - Choose a folder name and click **Create Git folder**. Databricks will clone the repo directly into your workspace — this becomes the source for your app.
-
-2. **Create the Databricks App**:
-   - In the sidebar, go to **Compute** > **Apps** (or search "Apps" in the workspace search bar).
-   - Click **Create app**, then choose **Custom** (or "From scratch").
-   - Give the app a name (e.g. `massive-lakebase-sync`).
-
-3. **Point the app at your Git folder**:
-   - When prompted for the source code location, select **Workspace files** / **Git folder** and browse to the Git folder you created in step 1 (the folder containing `app.py` and `app.yaml`).
-   - Databricks will read `app.yaml` from that folder automatically to configure the `command` and `env` (including the `LAKEBASE_URL`, `MASSIVE_API_BASE_URL`, and secret scope/key references).
-
-4. **Deploy**:
-   - Click **Deploy** (or **Create and deploy**) in the Apps UI. Databricks will build and start the app using the Git folder's current contents — no `databricks` CLI commands are needed.
-   - Whenever you update the code, pull the latest changes into the Git folder (**Git folder** > **Pull**, via the UI) and click **Deploy** again in the Apps UI to redeploy.
-
-5. Once deployed, open the app's URL from the Apps UI and hit `GET /healthz` to confirm it's running, then try `POST /sync` to pull data from Massive into Lakebase.
-
-## Endpoints
-
-- `GET /healthz` - health check
-- `GET /records?limit=100` - read synced records from Lakebase
-- `POST /sync?batch_size=500` with optional JSON body `{"path": "/records"}` - pull from Massive API and upsert into Lakebase
-- `GET /watchlist` - get the current user's watchlist symbols with last known price
-- `POST /watchlist` - add/update a symbol on the current user's watchlist
-
-## Enabling Change Data Feed (CDF) for Postgres tables
-
-Lakebase supports **Change Data Feed (CDF)**, a managed way to stream row-level inserts/updates/deletes
-from your Lakebase Postgres tables into Unity Catalog Delta tables (no Debezium, no custom connectors).
-CDF is enabled per-**schema** in the `databricks_postgres` database, and every table in that schema that
-meets two conditions is picked up automatically: it has `REPLICA IDENTITY FULL` set, and it has at least
-one row.
-
-### 1. Set `REPLICA IDENTITY FULL` on the tables you want to track
-
-By default, Postgres only logs primary-key columns on change. To capture full row contents (needed for
-CDF), enable `REPLICA IDENTITY FULL` on each table — including `watchlist` and `massive_records` from
-this app:
-
-```sql
-ALTER TABLE watchlist REPLICA IDENTITY FULL;
-ALTER TABLE massive_records REPLICA IDENTITY FULL;
-```
-
-Run this once per table, either from a Databricks SQL editor connected to your Lakebase instance, or
-from a `psql` session using your `LAKEBASE_URL`. Any new table you add later (e.g. via `ensure_table`-style
-helpers in `app.py`) needs the same `ALTER TABLE ... REPLICA IDENTITY FULL` statement run once before it
-will be included in the feed. Tables with the setting but zero rows are skipped until the first row is
-inserted, then picked up automatically.
-
-You can confirm which tables currently qualify by querying:
-
-```sql
-SELECT * FROM wal2delta.tables;
-```
-
-### 2. Start CDF from the Lakebase UI
-
-1. In your Databricks workspace, open the **Lakebase** tab for your instance.
-2. Go to **Lakebase CDF** and click **Start**.
-3. Select the `databricks_postgres` database and the schema containing your tables (the default
-   schema, `public`, works — it's inside `databricks_postgres`).
-4. Choose the Unity Catalog destination schema/catalog where the CDF history tables should land.
-5. Confirm — the UI shows a preview of qualifying tables (e.g. `watchlist`, `massive_records`) and
-   their sync status before you start.
-
-Once running, each qualifying table gets a corresponding Delta table named `lb_<table_name>_history`
-(e.g. `lb_watchlist_history`) in Unity Catalog, updated roughly every 15 seconds. Each row includes
-metadata columns (`_pg_change_type`, `_pg_lsn`, `_pg_xid`, `_timestamp`, `_sort_by`) describing the
-change, so downstream Delta Live Tables/pipelines can build Silver/Gold layers off the append-only
-history.
-
-> **Note:** Disabling CDF is lossy — changes made while it's off aren't captured, and re-enabling
-> triggers a full resync (every row reloaded as an `insert`). There's no per-table exclusion option
-> within an enabled schema; the only way to keep a table out of the feed is to not set
-> `REPLICA IDENTITY FULL` on it.
-
-## Notes
-
-- Lakebase auth uses a single `LAKEBASE_URL` secret pointing at a native Postgres role with a
-  static, non-expiring password — no token refresh logic needed in `lakebase.py`.
-- The Massive API pagination in `massive_client.py` assumes a `{"items": [...], "next_cursor": ...}`
-  cursor-based shape. Adjust `paginated_get` to match the real API's pagination contract.
-- For very large batch upserts, consider `psycopg2.extras.execute_values` instead of per-row inserts.
+- No passwords, connection strings, or API keys appear in this repository. The
+  connection URL lives only in the Databricks secret store.
+- `.env` is gitignored; `.env.example` contains no real values.
+- All SQL uses parameterised queries, so user input is never string-interpolated
+  into a statement.
+- User-supplied text is HTML-escaped before rendering.

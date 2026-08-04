@@ -24,6 +24,7 @@ import os
 import re
 
 from flask import Flask, abort, jsonify, render_template, request
+from werkzeug.exceptions import HTTPException
 
 import lakebase
 
@@ -53,13 +54,19 @@ def healthz():
 
 @app.errorhandler(Exception)
 def handle_exception(err):
-    """Ensure all unhandled errors return JSON (not an HTML error page),
-    so the frontend's resp.json() call never chokes on HTML."""
+    """Return JSON for every error (not an HTML error page), so the frontend's
+    resp.json() call never chokes on HTML.
+
+    Deliberate errors (abort(...)) carry a safe, human-readable description.
+    Anything unexpected is logged in full but answered with a generic message:
+    driver-level exception text can name the database host and role, which has
+    no business reaching the browser.
+    """
+    if isinstance(err, HTTPException):
+        return jsonify({"error": err.description}), err.code
+
     logger.exception("Unhandled exception while processing request")
-    status_code = getattr(err, "code", 500)
-    if not isinstance(status_code, int):
-        status_code = 500
-    return jsonify({"error": str(err)}), status_code
+    return jsonify({"error": "Internal server error"}), 500
 
 
 @app.route("/")
